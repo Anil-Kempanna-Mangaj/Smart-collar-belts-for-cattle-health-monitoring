@@ -1,0 +1,235 @@
+#define BLYNK_TEMPLATE_ID "TMPL3zi-4NSoc"
+#define BLYNK_TEMPLATE_NAME "SMART COLLER BELT CATTLE HEALTH MONITORING"
+#define BLYNK_AUTH_TOKEN "XlJj_eHUQZw9Z_IlEwYWXWWu-Dnrxzx6"
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <DHT.h>
+#include <Adafruit_MLX90614.h>
+#include "MPU6050_light.h"
+#include <TimeLib.h>
+
+// ======= Blynk Credentials =======
+char ssid[] = "SysytemAK";
+char pass[] = "mangajak";
+char auth[] = "XlJj_eHUQZw9Z_IlEwYWXWWu-Dnrxzx6";
+
+// ======= Pin Configuration =======
+#define DHTPIN 15
+#define DHTTYPE DHT11
+
+// ======= Project Constants =======
+const float expectedMilkLiters = 6.0;  // expected daily milk per cow
+const float DT_THRESHOLD = 0.7;        // ΔT threshold (°C)
+const float THI_HEAT_THRESHOLD = 72.0; // Thermal-Humidity Index threshold
+const float ACTIVITY_GOOD_PERCENT = 70.0;
+const float MILK_GOOD_PERCENT = 85.0;
+
+// ======= Objects =======
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+MPU6050 mpu(Wire);
+BlynkTimer timer;
+
+// ======= Variables =======
+float lastAmbient = 0.0, lastHumidity = 0.0, lastBodyTemp = 0.0;
+float lastTHI = 0.0, lastDT = 0.0, lastActivityPercent = 0.0;
+unsigned long lastWindowStart = 0;
+int movementCount = 0, movementCountWindow = 0;
+float todaysMilk = 0.0;
+String lastAlert = "Normal";
+
+// ======= Helper Functions =======
+float computeTHI(float ambientC, float humidityPercent) {
+  float rh = humidityPercent / 100.0;
+  return ambientC - (0.55 - 0.55 * rh) * (ambientC - 14.5);
+}
+
+float computeActivityPercent(int count) {
+  const float maxMovement = 40.0; // adjust per field test
+  float pct = (count / maxMovement) * 100.0;
+  if (pct > 100.0) pct = 100.0;
+  if (pct < 0.0) pct = 0.0;
+  return pct;
+}
+
+// ======= Blynk Event Notification (Updated for Blynk IoT) =======
+void sendEventNotification(String type, String details) {
+  if (type == "Heat Stress") {
+    Blynk.logEvent("heat_stress", "⚠ Heat Stress Warning: " + details);
+  }
+  else if (type == "Health Alert") {
+    Blynk.logEvent("health_alert", "🚨 Health Alert: " + details);
+  }
+}
+
+// ======= Log to Serial + Blynk Terminal =======
+void logToTerminal(String alertType, float body, float amb, float dT, float thi, float act, float milkPct) {
+  String t = String(hour()) + ":" + String(minute()) + ":" + String(second());
+  String msg = "[" + t + "] " + alertType +
+               " | Body:" + String(body, 1) + "°C" +
+               " | Amb:" + String(amb, 1) + "°C" +
+               " | ΔT:" + String(dT, 2) +
+               " | THI:" + String(thi, 1) +
+               " | Act:" + String(act, 1) + "%" +
+               " | Milk:" + String(milkPct, 1) + "%";
+  Serial.println(msg);
+  Blynk.virtualWrite(V9, msg);
+}
+
+// ======= Milk Input from Blynk App =======
+BLYNK_WRITE(V4) {
+  todaysMilk = param.asFloat();
+  Blynk.virtualWrite(V5, todaysMilk);  // update graph
+}
+
+// ======= Process MPU6050 (Improved Activity Detection) =======
+void processMPU() {
+  static float lastMag = 0.0;
+  mpu.update();
+
+  float ax = mpu.getAccX();
+  float ay = mpu.getAccY();
+  float az = mpu.getAccZ();
+
+  // Debug print raw data
+  Serial.print("AX: "); Serial.print(ax, 4);
+  Serial.print(" | AY: "); Serial.print(ay, 4);
+  Serial.print(" | AZ: "); Serial.print(az, 4);
+
+  float mag = sqrt(ax * ax + ay * ay + az * az);
+  float delta = fabs(mag - lastMag);
+  lastMag = mag;
+
+  const float movementThreshold = 0.03; // detect small changes in motion
+  if (delta > movementThreshold) {
+    movementCount++;
+    Serial.print(" -> Movement detected (Δ=");
+    Serial.print(delta, 3);
+    Serial.print(")");
+  }
+
+  Serial.println();
+
+  unsigned long nowMs = millis();
+  if (nowMs - lastWindowStart >= 60000UL) { // every 1 minute
+    movementCountWindow = movementCount;
+    movementCount = 0;
+    lastWindowStart = nowMs;
+
+    lastActivityPercent = computeActivityPercent(movementCountWindow);
+    Serial.print("Activity %: ");
+    Serial.println(lastActivityPercent);
+
+    Blynk.virtualWrite(V3, lastActivityPercent);
+  }
+}
+
+// ======= Publish All Telemetry to Blynk =======
+void publishTelemetry() {
+  // --- Read Ambient & Humidity ---
+  float ambient = dht.readTemperature();
+  float hum = dht.readHumidity();
+  if (!isnan(ambient) && !isnan(hum)) {
+    lastAmbient = ambient;
+    lastHumidity = hum;
+    Blynk.virtualWrite(V0, lastAmbient);
+    Blynk.virtualWrite(V2, lastHumidity);
+  }
+
+  // --- Read Body Temp ---
+  float body = mlx.readObjectTempC();
+  if (!isnan(body)) {
+    lastBodyTemp = body;
+    Blynk.virtualWrite(V1, lastBodyTemp);
+  }
+
+  // --- Derived Calculations ---
+  lastDT = lastBodyTemp - lastAmbient;
+  lastTHI = computeTHI(lastAmbient, lastHumidity);
+  float milkPercent = (todaysMilk / expectedMilkLiters) * 100.0;
+
+  Blynk.virtualWrite(V8, lastDT);
+  Blynk.virtualWrite(V6, lastTHI);
+
+  // --- Decision Logic ---
+  bool dtHigh = (lastDT > DT_THRESHOLD);
+  bool thiHigh = (lastTHI > THI_HEAT_THRESHOLD);
+  String alertType = "Normal";
+  int alertCode = 0;
+
+  if (!dtHigh) {
+    if (thiHigh) {
+      alertType = "Heat Stress";
+      alertCode = 1;
+    }
+  } else {
+    if (lastActivityPercent < ACTIVITY_GOOD_PERCENT && milkPercent < MILK_GOOD_PERCENT) {
+      alertType = "Health Alert";
+      alertCode = 2;
+    } else if (thiHigh) {
+      alertType = "Heat Stress";
+      alertCode = 1;
+    }
+  }
+
+  // --- Send Notification Only When State Changes ---
+  if (alertType != lastAlert) {
+    String details = "Body:" + String(lastBodyTemp, 1) + "°C, Amb:" + String(lastAmbient, 1) +
+                     "°C, Act:" + String(lastActivityPercent, 0) + "%, Milk:" + String(milkPercent, 0) + "%";
+    sendEventNotification(alertType, details);
+    lastAlert = alertType;
+  }
+
+  // --- Log and Display ---
+  logToTerminal(alertType, lastBodyTemp, lastAmbient, lastDT, lastTHI, lastActivityPercent, milkPercent);
+  Blynk.virtualWrite(V7, alertCode); // LED / Indicator
+  Blynk.virtualWrite(V5, todaysMilk); // Graph
+}
+
+// ======= Setup =======
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22); // I2C pins for ESP32
+  dht.begin();
+  mlx.begin();
+
+  Serial.println("Initializing MPU6050...");
+  byte status = mpu.begin();
+  if (status != 0) {
+    Serial.print("MPU begin() returned code: ");
+    Serial.println(status);
+    Serial.println("Trying address 0x69...");
+    status = mpu.begin(0x69);
+    if (status != 0) {
+      Serial.print("MPU begin(0x69) also failed. Code: ");
+      Serial.println(status);
+      Serial.println("Check wiring, power (3.3V), AD0 jumper, or module health.");
+    } else {
+      Serial.println("MPU6050 connected at 0x69");
+      delay(300);
+      mpu.calcOffsets();
+      Serial.println("MPU6050 offsets calibrated.");
+    }
+  } else {
+    Serial.println("MPU6050 connected at default address (0x68)");
+    delay(300);
+    mpu.calcOffsets();
+    Serial.println("MPU6050 offsets calibrated.");
+  }
+
+  Serial.println("🐄 Smart Cattle Health Belt Starting...");
+  Blynk.begin(auth, ssid, pass);
+
+  Blynk.virtualWrite(V9, "=== Smart Cattle Monitoring Log Started ===");
+
+  timer.setInterval(10000L, publishTelemetry); // every 10s
+  timer.setInterval(500L, processMPU);         // every 0.5s
+}
+
+// ======= Loop =======
+void loop() {
+  Blynk.run();
+  timer.run();
+}
